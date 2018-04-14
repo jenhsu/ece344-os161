@@ -1,0 +1,272 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+
+/*
+ * Note! If OPT_DUMBVM is set, as is the case until you start the VM
+ * assignment, this file is not compiled or linked or in any way
+ * used. The cheesy hack versions in dumbvm.c are used instead.
+ */
+
+#define DUMBVM_STACKPAGES    12
+
+struct addrspace *
+as_create(void)
+{
+//	kprintf("as_create\n");
+	struct addrspace *as = kmalloc(sizeof(struct addrspace));
+	if (as==NULL) {
+		return NULL;
+	}
+
+	as->as_vbase1 = 0;
+	as->as_npages1 = 0;
+
+	as->as_vbase2 = 0;
+	as->as_npages2 = 0;
+
+	as->as_stackvbase = 0;
+	as->heapstart = 0;
+	as->heapend = 0;
+	as->page_table_directory = NULL;
+
+
+	/*
+	 * Initialize as needed.
+	 */
+
+	as->page_table_directory = kmalloc(sizeof(struct page_table)*PAGE_DIRECTORY_SIZE);
+	if (as->page_table_directory == NULL)
+		return ENOMEM;
+
+	int i;
+	for(i=0;i<PAGE_DIRECTORY_SIZE;i++)
+		as->page_table_directory[i].page_table = NULL;
+
+	return as;
+}
+
+int
+as_copy(struct addrspace *old, struct addrspace **ret)
+{
+	struct addrspace *newas;
+
+	newas = as_create();
+	if (newas==NULL) {
+		return ENOMEM;
+	}
+
+	/*
+	 * Write this.
+	 */
+	newas->as_vbase1 = old->as_vbase1;
+	newas->as_npages1 = old->as_npages1;
+
+	newas->as_vbase2 = old->as_vbase2;
+	newas->as_npages2 = old->as_npages2;
+
+	newas->heapstart = old->heapstart;
+	newas->heapend = old->heapend;
+	newas->as_stackvbase = old->as_stackvbase;
+
+
+		int i;
+		for(i=0;i<PAGE_DIRECTORY_SIZE;i++){
+			if(old->page_table_directory[i].page_table!=NULL){
+				newas->page_table_directory[i].page_table = kmalloc(sizeof(struct page_table)*PAGE_TABLE_SIZE);
+				if (newas->page_table_directory[i].page_table == NULL)
+					return ENOMEM;
+				int j;
+				for(j=0;j<PAGE_TABLE_SIZE;j++){
+					if (old->page_table_directory[i].page_table[j].ifvalid == 1){
+						newas->page_table_directory[i].page_table[j].paddr = getppages(1);
+						if(newas->page_table_directory[i].page_table[j].paddr==0)
+							return ENOMEM;
+						newas->page_table_directory[i].page_table[j].ifvalid = 1;
+						memmove((void *)PADDR_TO_KVADDR(newas->page_table_directory[i].page_table[j].paddr),
+						(const void *)PADDR_TO_KVADDR(old->page_table_directory[i].page_table[j].paddr),PAGE_SIZE);
+					}
+					else{
+						newas->page_table_directory[i].page_table[j].paddr=0;
+						newas->page_table_directory[i].page_table[j].ifvalid = 0;
+					}
+				}
+			}
+			else
+				newas->page_table_directory[i].page_table = NULL;
+		}
+
+	    assert(newas->as_vbase1 != 0);
+	    assert(newas->as_vbase2 != 0);
+	    assert(newas->as_npages2 != 0);
+	    assert(newas->as_npages1 != 0);
+	    assert(newas->as_stackvbase != 0);
+	    assert(newas->heapstart != 0);
+	    assert(newas->heapend != 0);
+
+	*ret = newas;
+	return 0;
+}
+
+void
+as_destroy(struct addrspace *as)
+{
+	/*
+	 * Clean up as needed.
+	 */
+
+	int spl = splhigh();
+
+	free_coremap(as);
+
+	int i;
+	for(i=0;i<PAGE_DIRECTORY_SIZE;i++){
+		if (as->page_table_directory[i].page_table != NULL){
+			kfree(as->page_table_directory[i].page_table);
+		}
+	}
+
+	kfree(as->page_table_directory);
+
+	kfree(as);
+
+	splx(spl);
+}
+
+void
+as_activate(struct addrspace *as)
+{
+	/*
+	 * Write this.
+	 */
+
+	int i, spl;
+
+		(void)as;
+
+		spl = splhigh();
+
+		for (i=0; i<NUM_TLB; i++) {
+			TLB_Write(TLBHI_INVALID(i), TLBLO_INVALID(), i);
+		}
+
+		splx(spl);
+}
+
+/*
+ * Set up a segment at virtual address VADDR of size MEMSIZE. The
+ * segment in memory extends from VADDR up to (but not including)
+ * VADDR+MEMSIZE.
+ *
+ * The READABLE, WRITEABLE, and EXECUTABLE flags are set if read,
+ * write, or execute permission should be set on the segment. At the
+ * moment, these are ignored. When you write the VM system, you may
+ * want to implement them.
+ */
+int
+as_define_region(struct addrspace *as, vaddr_t vaddr, size_t sz,
+		 int readable, int writeable, int executable)
+{
+	/*
+	 * Write this.
+	 */
+
+	int spl = splhigh();
+
+	size_t npages;
+
+	/* Align the region. First, the base... */
+	sz += vaddr & ~(vaddr_t)PAGE_FRAME;
+	vaddr &= PAGE_FRAME;
+
+	/* ...and now the length. */
+	sz = (sz + PAGE_SIZE - 1) & PAGE_FRAME;
+
+	npages = sz / PAGE_SIZE;
+
+	/* We don't use these - all pages are read-write */
+	(void)readable;
+	(void)writeable;
+	(void)executable;
+
+	if (as->as_vbase1 == 0) {
+		as->as_vbase1 = vaddr;
+//		kprintf("1 as->as_vbase1 0x%x\n", as->as_vbase1);
+		as->as_npages1 = npages;
+		splx(spl);
+		return 0;
+	}
+
+	if (as->as_vbase2 == 0) {
+//		kprintf("virtual address of data: %x\n",vaddr);
+		as->as_vbase2 = vaddr;
+		as->as_npages2 = npages;
+		as->heapstart = vaddr + npages * PAGE_SIZE;
+		as->heapend = as->heapstart;
+		splx(spl);
+		return 0;
+	}
+
+	return EUNIMP;
+}
+
+int
+as_prepare_load(struct addrspace *as)
+{
+	/*
+	 * Write this.
+	 */
+	(void) as;
+//	assert(as->as_pbase1 == 0);
+//		assert(as->as_pbase2 == 0);
+//		assert(as->as_stackpbase == 0);
+//
+//
+//		as->as_pbase1 = getppages(as->as_npages1);
+//		if (as->as_pbase1 == 0) {
+//			return ENOMEM;
+//		}
+//
+//		as->as_pbase2 = getppages(as->as_npages2);
+//		if (as->as_pbase2 == 0) {
+//			return ENOMEM;
+//		}
+//
+//		as->as_stackpbase = getppages(DUMBVM_STACKPAGES);
+//		if (as->as_stackpbase == 0) {
+//			return ENOMEM;
+//		}
+//
+//		return 0;
+	return 0;
+}
+
+int
+as_complete_load(struct addrspace *as)
+{
+	/*
+	 * Write this.
+	 */
+
+	(void)as;
+	return 0;
+}
+
+int
+as_define_stack(struct addrspace *as, vaddr_t *stackptr)
+{
+	/*
+	 * Write this.
+	 */
+
+	as -> as_stackvbase = USERSTACK;
+
+	/* Initial user-level stack pointer */
+	*stackptr = USERSTACK;
+
+	return 0;
+}

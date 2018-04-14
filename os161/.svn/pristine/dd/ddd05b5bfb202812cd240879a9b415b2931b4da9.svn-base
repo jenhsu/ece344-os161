@@ -1,0 +1,518 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <uio.h>
+#include <vnode.h>
+#include <vfs.h>
+#include <curthread.h>
+#include <thread.h>
+#include <synch.h>
+#include <addrspace.h>
+#include <kern/limits.h>
+
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+
+void
+mips_syscall(struct trapframe *tf)
+{
+	int callno;
+	int32_t retval;
+	int err;
+
+	assert(curspl==0);
+
+	callno = tf->tf_v0;
+
+	/*
+	 * Initialize retval to 0. Many of the system calls don't
+	 * really return a value, just 0 for success and -1 on
+	 * error. Since retval is the value returned on success,
+	 * initialize it to 0 by default; thus it's not necessary to
+	 * deal with it except for calls that return other values, 
+	 * like write.
+	 */
+
+	retval = 0;
+
+	switch (callno) {
+	    case SYS_reboot:
+	    	err = sys_reboot(tf->tf_a0);
+	    	break;
+
+	    case SYS_write:
+	    	err = sys_write(tf->tf_a0, (userptr_t)tf->tf_a1, tf->tf_a2,  &retval);
+	    	break;
+
+	    case SYS_read:
+	    	err = sys_read(tf->tf_a0, (char*)tf->tf_a1, tf->tf_a2, &retval);
+	    	break;
+
+	    case SYS_fork:
+	    	err= sys_fork(tf, &retval);
+	    	break;
+
+		case SYS_getpid:
+			retval = sys_getpid();
+			err = 0;
+			break;
+
+		case SYS__exit:
+			sys_exit(tf->tf_a0);
+			break;
+
+		case SYS_waitpid:
+			err = sys_waitpid((int)tf->tf_a0, (int *)tf->tf_a1, tf->tf_a2);
+			break;
+
+		case SYS_execv:
+			err = sys_execv((char*)tf->tf_a0, (char**)tf->tf_a1);
+			break;
+
+
+	    /* Add stuff here */
+
+	    default:
+			kprintf("Unknown syscall %d\n", callno);
+			err = ENOSYS;
+		break;
+	}
+
+
+	if (err) {
+		/*
+		 * Return the error code. This gets converted at
+		 * userlevel to a return value of -1 and the error
+		 * code in errno.
+		 */
+		tf->tf_v0 = err;
+		tf->tf_a3 = 1;      /* signal an error */
+	}
+	else {
+		/* Success. */
+		tf->tf_v0 = retval;
+		tf->tf_a3 = 0;      /* signal no error */
+	}
+	
+	/*
+	 * Now, advance the program counter, to avoid restarting
+	 * the syscall over and over again.
+	 */
+	
+	tf->tf_epc += 4;
+
+	/* Make sure the syscall code didn't forget to lower spl */
+	assert(curspl==0);
+}
+
+void
+md_forkentry(void *data1, unsigned long data2)
+{
+	struct trapframe tf;
+	struct trapframe *tf_copy = (struct trapframe *)data1;
+	struct addrspace *as_copy = (struct addrspace *)data2;
+
+	//copy the parent's tf onto the stack of the child
+	memcpy(&tf,tf_copy,sizeof(struct trapframe));
+	kfree(data1);
+
+	//set return value to 0 for child, indicate system call is successful, increment the PC
+	tf.tf_v0 = 0;
+	tf.tf_a3 = 0;
+	tf.tf_epc += 4;
+
+	curthread->t_vmspace = as_copy;
+
+	as_activate(curthread->t_vmspace);
+
+	mips_usermode(&tf);
+}
+
+int sys_fork(struct trapframe *tf, int* ret)
+{
+
+	int result;
+	struct addrspace *addrcopy;
+	struct thread *child_thread = NULL;
+
+	//copy parent's trapframe to pass to child
+	struct trapframe *tf_copy = kmalloc(sizeof(struct trapframe));
+
+	if (tf_copy == NULL) {
+//		splx(s);
+		return ENOMEM;
+	}
+
+	memcpy(tf_copy,tf,sizeof(struct trapframe));
+
+
+	//copy parent's address space to pass to child
+	result = as_copy(curthread->t_vmspace, &addrcopy);
+
+	if (result) {
+		kfree(tf_copy);
+		//return ENOMEM
+		return result;
+	}
+
+	as_activate(curthread->t_vmspace);
+
+	//kprintf("in fork parent pid:%d\n",curthread->pid);
+
+	result=thread_fork(curthread->t_name, (void*)tf_copy,(unsigned long)addrcopy, md_forkentry, &child_thread);
+
+	if(result)
+	{
+		kfree(tf_copy);
+		return result;
+	}
+
+	//Return child's PID to parent
+	*ret = child_thread->pid;
+
+    return 0;
+}
+
+int sys_getpid(void)
+{
+    return curthread->pid;
+}
+
+int
+sys_write(int fd, userptr_t buf, size_t nbytes, int *ret)
+{
+	(void)fd;
+	if (fd <= 0 || fd == 5){
+		//*ret = EBADF;
+		return EBADF;
+	}
+
+	if (buf == NULL){
+		//*ret = EFAULT;
+		return EFAULT;
+	}
+
+	char* ptr = kmalloc((nbytes+1)*sizeof(char));
+
+	int err = copyin(buf, ptr, nbytes);
+	if (err == 0){
+		ptr[nbytes]= '\0';
+
+		int i;
+		for (i=0; i < nbytes; i++){
+			putch(ptr[i]);
+		}
+
+//		kprintf ("%s",ptr);
+
+
+		kfree(ptr);
+		*ret = nbytes;
+		return 0;
+	}
+	else{
+		kfree(ptr);
+		//*ret = EFAULT;
+		return EFAULT;
+	}
+}
+
+int
+sys_read(int fd, char* buf, size_t buflen, int* ret)
+{
+	if (fd != 0){
+		return EBADF;
+	}
+
+	if(buf == NULL){
+		return EFAULT;
+	}
+
+	int err = 0;
+	int count = 0;
+
+	char *msg = kmalloc((buflen+1)*sizeof(char));
+
+	while(count < buflen){
+	  msg[count]=getch();
+	  count++;
+	}
+
+	//err = copyout((const void*)msg, (userptr_t)buf, (sizeof(char))*count+1u);
+	err = copyout(msg, (userptr_t)buf, count+1);
+
+	if(err != 0){
+		kfree(msg);
+		return EFAULT;
+	}
+
+	kfree(msg);
+	*ret = count+1;
+	return 0;
+}
+
+pid_t sys_waitpid(pid_t pid, int *status, int options)
+{
+	P(lock);
+
+	struct thread *child;
+
+	//check is options equal 0
+	if (options != 0){
+		V(lock);
+		return EINVAL;
+	}
+
+	//check if pid process is your child
+	if (all_thread[pid]->parent != curthread->pid){
+		V(lock);
+		return EINVAL;
+	}
+
+	//check if status is valid
+	if (status == NULL){
+		V(lock);
+		return EFAULT;
+	}
+
+	// check if the parent has waited on children
+	if (all_thread[pid]->haswaiting == 1){
+		V(lock);
+//		kprintf("\nwaitpid lock sem count %d\n", lock->count);
+		return EINVAL;
+	}
+
+	//set child to have waiting parent
+	all_thread[pid]->haswaiting = 1;
+
+//	kprintf("\npid is %d has exited %d\n", pid, all_thread[pid]->exited);
+
+	//check if child has exited already
+	if (all_thread[pid]->thread == NULL){
+		*status = all_thread[pid]->exitcode;
+		V(lock);
+
+		return 0;
+	}
+	//child has not exited, wait on child semaphore
+	else {
+		child = all_thread[pid]->thread;
+
+
+//		kprintf("\n wait for child %d\n", pid);
+		P(child->wait);
+		V(lock);
+		//return exitcode
+		*status = all_thread[pid]->exitcode;
+
+		return 0;
+	}
+}
+
+void sys_exit(int exitcode)
+{
+	//set the exitcode
+	all_thread[curthread->pid]-> exitcode = exitcode;
+
+	all_thread[curthread->pid]->thread = NULL;
+
+	thread_exit();
+	return;
+}
+
+int sys_execv(const char *program, char **args){
+	struct vnode *v;
+	vaddr_t entrypoint, stackptr;
+	int result;
+
+//	kprintf("%c,\n", *program);
+
+	if(program == NULL){
+		return ENOENT;
+	}
+
+	if(args == NULL){
+		return EFAULT;
+	}
+
+	char* kprogram = kmalloc(sizeof(char*));
+		if(kprogram == NULL){
+			kfree(kprogram);
+			return ENOMEM;
+		}
+	char** kargs = (char **)kmalloc(sizeof(char*));
+		if(kargs == NULL){
+			kfree(kargs);
+			kfree(kprogram);
+			return ENOMEM;
+		}
+
+
+	result = copyinstr(program, kprogram, PATH_MAX, NULL);
+	if(result){
+		kfree(kprogram);
+		kfree(kargs);
+		return result;
+	}
+
+	int i=0;
+	while(args[i] != NULL){
+		int length = strlen(args[i]);
+		length = length + 1;
+		kargs[i] = (char*)kmalloc(length*sizeof(char));
+		if(kargs[i] == NULL){
+			kfree(kargs[i]);
+			kfree(kprogram);
+			kfree(kargs);
+			return result;
+		}
+
+		result = copyinstr((userptr_t)args[i], kargs[i], length+1, NULL);
+		if (result){
+			kfree(kargs[i]);
+			kfree(kprogram);
+			kfree(kargs);
+			return result;
+		}
+		i++;
+	}
+	int argc = i;
+
+	kargs[argc] = NULL;
+
+		/* Open the file. */
+		result = vfs_open(program, O_RDONLY, &v);
+		if (result) {
+			kfree(kprogram);
+			kfree(kargs);
+			return result;
+		}
+
+//		/* We should be a new thread. */
+//		assert(curthread->t_vmspace == NULL);
+
+		as_destroy(curthread->t_vmspace);
+
+		curthread->t_vmspace = NULL;
+		/* Create a new address space. */
+		curthread->t_vmspace = as_create();
+
+		if (curthread->t_vmspace==NULL) {
+			kfree(kprogram);
+			kfree(kargs);
+			vfs_close(v);
+			return ENOMEM;
+		}
+
+		/* Activate it. */
+		as_activate(curthread->t_vmspace);
+
+		/* Load the executable. */
+		result = load_elf(v, &entrypoint);
+		if (result) {
+			as_destroy(curthread->t_vmspace);
+			kfree(kprogram);
+			kfree(kargs);
+			/* thread_exit destroys curthread->t_vmspace */
+			vfs_close(v);
+			return result;
+		}
+
+
+		/* Done with the file now. */
+		vfs_close(v);
+
+		/* Define the user stack in the address space */
+		result = as_define_stack(curthread->t_vmspace, &stackptr);
+		if (result) {
+			kfree(kprogram);
+			kfree(kargs);
+			/* thread_exit destroys curthread->t_vmspace */
+			return result;
+		}
+
+		char* argv;
+		int spaddr[argc];
+
+		for(i =argc-1; i>=0;i--){
+			argv = kargs[i];
+			int len = strlen(argv)+1;
+			if(len%4==0)
+				stackptr = stackptr - len;
+			else
+				stackptr = stackptr - len - (4-len%4);
+			copyoutstr(argv,(userptr_t)stackptr, len, NULL);
+			spaddr[i] = stackptr;
+		}
+
+		stackptr -= 4;
+		copyout("\0", stackptr, 4);
+
+
+		for(i =argc-1; i>=0;i--){
+			stackptr = stackptr - 4;
+			copyout(&spaddr[i],(userptr_t)stackptr, sizeof(spaddr[i]));
+		}
+////////////////////////////////////////////////
+//		userptr_t address;
+//		address = (userptr_t)stackptr;
+//		stackptr = stackptr - 4;
+//		copyout(&argc, stackptr, 4);
+//
+//		md_usermode(argc, (userptr_t )address,
+//			    stackptr, entrypoint);
+
+//		kfree(kprogram);
+//		kfree(kargs);
+//
+		/* Warp to user mode. */
+		md_usermode(argc /*argc*/, (userptr_t)stackptr /*userspace addr of argv*/,
+			    stackptr, entrypoint);
+
+		/* md_usermode does not return */
+		panic("md_usermode returned\n");
+		return EINVAL;
+
+}

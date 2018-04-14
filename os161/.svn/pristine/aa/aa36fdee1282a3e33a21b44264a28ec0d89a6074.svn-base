@@ -1,0 +1,313 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <kern/unistd.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <uio.h>
+#include <vnode.h>
+#include <vfs.h>
+#include <curthread.h>
+#include <thread.h>
+#include <synch.h>
+#include <addrspace.h>
+//#include <writeread.h>
+
+
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+int sleep = 0;
+int currentpid = -1;
+
+void
+mips_syscall(struct trapframe *tf)
+{
+	int callno;
+	int32_t retval;
+	int err;
+
+	assert(curspl==0);
+
+	callno = tf->tf_v0;
+
+	/*
+	 * Initialize retval to 0. Many of the system calls don't
+	 * really return a value, just 0 for success and -1 on
+	 * error. Since retval is the value returned on success,
+	 * initialize it to 0 by default; thus it's not necessary to
+	 * deal with it except for calls that return other values, 
+	 * like write.
+	 */
+
+	retval = 0;
+
+	switch (callno) {
+	    case SYS_reboot:
+	    	err = sys_reboot(tf->tf_a0);
+	    	break;
+
+	    case SYS_write:
+	    	err = sys_write(tf->tf_a0, (userptr_t)tf->tf_a1, tf->tf_a2,  &retval);
+	    	break;
+
+	    case SYS_read:
+	    	err = sys_read(tf->tf_a0, (char*)tf->tf_a1, tf->tf_a2, &retval);
+	    	break;
+
+	    case SYS_fork:
+	    	err= sys_fork(tf, &retval);
+	    	break;
+
+		case SYS_getpid:
+			retval = sys_getpid();
+			err = 0;
+			break;
+
+		case SYS__exit:
+			retval = sys_exit();
+			break;
+	    /* Add stuff here */
+ 
+	    default:
+			kprintf("Unknown syscall %d\n", callno);
+			err = ENOSYS;
+		break;
+	}
+
+
+	if (err) {
+		/*
+		 * Return the error code. This gets converted at
+		 * userlevel to a return value of -1 and the error
+		 * code in errno.
+		 */
+		tf->tf_v0 = err;
+		tf->tf_a3 = 1;      /* signal an error */
+	}
+	else {
+		/* Success. */
+		tf->tf_v0 = retval;
+		tf->tf_a3 = 0;      /* signal no error */
+	}
+	
+	/*
+	 * Now, advance the program counter, to avoid restarting
+	 * the syscall over and over again.
+	 */
+	
+	tf->tf_epc += 4;
+
+	/* Make sure the syscall code didn't forget to lower spl */
+	assert(curspl==0);
+}
+
+void
+md_forkentry(void *data1, unsigned long data2)
+{
+	int s = splhigh();
+
+	struct trapframe tf;
+
+	memcpy(&tf,(struct trapframe*)data1,sizeof(struct trapframe));
+	kfree(data1);
+
+
+	//Set the return value to 0 for the child process and advance the program counter to avoid restarting the syscall
+	tf.tf_v0 = 0;
+	tf.tf_a3 = 0;
+	tf.tf_epc += 4;
+
+	//copy addrspace from previously stored tf
+	curthread->t_vmspace = (struct addrspace *)data2;
+
+	as_activate(curthread->t_vmspace);
+
+	splx(s);
+
+	mips_usermode(&tf);
+}
+
+int sys_fork(struct trapframe *tf, int* ret){
+	int s = splhigh();
+
+	int result;
+	struct addrspace *addrcopy;
+	struct thread *child_thread = NULL;
+
+	//Make a copy of the parent's trap frame on the kernel heap
+	struct trapframe *tf_copy = kmalloc(sizeof(struct trapframe));
+
+//	if (tf_copy == NULL) {
+//		//splx(s);
+//		return ENOMEM;
+//	}
+
+	//copy mem
+	memcpy(tf_copy,tf,sizeof(struct trapframe));
+
+//	kfree(tf);
+
+	result = as_copy(curthread->t_vmspace, &addrcopy);
+
+	if (result) {
+		kfree(tf_copy);
+		splx(s);
+		return result;
+	}
+
+	as_activate(curthread->t_vmspace);
+
+	result=thread_fork(curthread->t_name, (void*)tf_copy,(unsigned long)addrcopy, md_forkentry, &child_thread);
+
+	if(result)
+	{
+		kfree(tf_copy);
+		splx(s);
+		return result;
+	}
+
+
+
+	//Return the child's process id
+	*ret = child_thread->pid;
+	//kprintf("\nsyscall fork: child pid %d\n", child_thread->pid);
+	splx(s);
+    return 0;
+}
+
+int sys_getpid(void){
+    return curthread->pid;
+}
+
+int
+sys_write(int fd, userptr_t buf, size_t nbytes, int *ret)
+{
+	(void)fd;
+	if (fd <= 0){
+		//*ret = EBADF;
+		return EBADF;
+	}
+
+	if (buf == NULL){
+		//*ret = EFAULT;
+		return EFAULT;
+	}
+
+	char* ptr = kmalloc((nbytes+1)*sizeof(char));
+
+	int err = copyin(buf, ptr, nbytes);
+	if (err == 0){
+		ptr[nbytes]= '\0';
+
+//		int i;
+//		for (i=0; i < nbytes; i++){
+//			putch(ptr[i]);
+//		}
+
+		kprintf ("%s",ptr);
+
+
+		kfree(ptr);
+		*ret = nbytes;
+		return 0;
+	}
+	else{
+		kfree(ptr);
+		//*ret = EFAULT;
+		return EFAULT;
+	}
+}
+
+int
+sys_read(int fd, char* buf, size_t buflen, int* ret)
+{
+	if (fd != 0){
+		//*ret = EBADF;
+		return EBADF;
+	}
+
+	if(buf == NULL){
+		//*ret = EFAULT;
+		return EFAULT;
+	}
+
+	int err = 0;
+	int count = 0;
+
+//	char *msg = kmalloc((buflen+1)*sizeof(char));
+	char *msg = (char *)kmalloc((buflen+1u) * sizeof(char));
+
+//	int i;
+//	for(i=0; i<buflen; i++){
+//		ch=getch();
+//		kprintf("char is %c\n", ch);
+//		//kprintf("msg[%d]= %c\n",i,msg[i]);
+//		count++;
+//
+//		if (ch=='\n' || ch=='\r') {
+//			putch('\n');
+//			break;
+//		}
+//	}
+
+	while(count < buflen){
+	  msg[count]=getch();
+	  count++;
+	}
+
+	//err = copyout((const void*)msg, (userptr_t)buf, (sizeof(char))*count+1u);
+	err = copyout(msg, (userptr_t)buf, count);
+
+	if(err != 0){
+		kfree(msg);
+		//*ret = EFAULT;
+		return EFAULT;
+	}
+
+	kfree(msg);
+	*ret = count;
+	return 0;
+}
+
+int sys_exit(void){
+	thread_exit();
+}
